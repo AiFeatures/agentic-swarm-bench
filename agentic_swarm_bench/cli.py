@@ -123,7 +123,7 @@ def _merge_extra_body(extra_body_json: str | None, enable_thinking: bool) -> dic
     return out or None
 
 
-def _build_config_safe(**kwargs) -> "BenchmarkConfig":
+def _build_config_safe(**kwargs):
     """Wrap build_config and convert TypeError (unknown YAML keys) to UsageError."""
     try:
         return build_config(**kwargs)
