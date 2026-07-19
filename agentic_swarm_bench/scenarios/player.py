@@ -135,10 +135,16 @@ class FailureTracker:
         return "ABORT: consecutive failure threshold exceeded"
 
 
-def _build_headers(config: BenchmarkConfig, upstream_api: str = "openai") -> dict:
+def _build_headers(
+    config: BenchmarkConfig,
+    upstream_api: str = "openai",
+    anthropic_beta: str | None = None,
+) -> dict:
     headers = {"Content-Type": "application/json"}
     if upstream_api == "anthropic":
         headers["anthropic-version"] = "2023-06-01"
+        if anthropic_beta:
+            headers["anthropic-beta"] = anthropic_beta
         if config.api_key:
             if config.api_key_header.lower() == "authorization":
                 headers["x-api-key"] = config.api_key
@@ -205,6 +211,7 @@ async def _replay_one_request(
     upstream_api: str = "openai",
     response_chunks: list[str] | None = None,
     thinking_chunks: list[str] | None = None,
+    tools: list[dict] | None = None,
 ) -> RequestMetrics:
     """Replay a single recorded request and collect timing metrics.
 
@@ -240,18 +247,20 @@ async def _replay_one_request(
             extra_body=extra_body,
             response_chunks=response_chunks,
             thinking_chunks=thinking_chunks,
+            tools=tools,
         )
 
-    capped_tokens = min(max_tokens, 4096)
     token_limit_key = "max_completion_tokens" if "api.openai.com" in url else "max_tokens"
     payload = {
         "model": model,
         "messages": messages,
-        token_limit_key: capped_tokens,
+        token_limit_key: max_tokens,
         "temperature": 0.7,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if tools:
+        payload["tools"] = tools
     if extra_body:
         payload.update(extra_body)
 
@@ -383,7 +392,8 @@ async def _replay_one_request(
 
     effective_tokens = metrics.completion_tokens
     if effective_tokens > 0 and first_token_time is not None:
-        metrics.decode_time_s = end - first_token_time
+        decode_end = last_token_time if last_token_time > first_token_time else end
+        metrics.decode_time_s = decode_end - first_token_time
         if metrics.decode_time_s > 0:
             metrics.tok_per_sec = effective_tokens / metrics.decode_time_s
 
@@ -395,6 +405,21 @@ async def _replay_one_request(
     if on_complete:
         on_complete()
     return metrics
+
+
+def _openai_tools_to_anthropic(tools: list[dict]) -> list[dict]:
+    """Convert OpenAI function-calling tools to Anthropic tool definitions."""
+    anthropic_tools = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+        fn = tool.get("function", {})
+        anthropic_tools.append({
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {}),
+        })
+    return anthropic_tools
 
 
 def _openai_msgs_to_anthropic(messages: list[dict]) -> tuple[list[str], list[dict]]:
@@ -483,6 +508,7 @@ async def _replay_one_request_anthropic(
     extra_body: dict | None = None,
     response_chunks: list[str] | None = None,
     thinking_chunks: list[str] | None = None,
+    tools: list[dict] | None = None,
 ) -> RequestMetrics:
     """Replay a single request via Anthropic Messages API.
 
@@ -500,15 +526,17 @@ async def _replay_one_request_anthropic(
     if not conversation:
         conversation.append({"role": "user", "content": ""})
 
-    capped_tokens = min(max_tokens, 4096)
     payload: dict = {
         "model": model,
         "messages": conversation,
-        "max_tokens": capped_tokens,
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
         "stream": True,
     }
     if system_parts:
         payload["system"] = "\n".join(system_parts)
+    if tools:
+        payload["tools"] = _openai_tools_to_anthropic(tools)
     if extra_body:
         payload.update(extra_body)
 
@@ -544,15 +572,18 @@ async def _replay_one_request_anthropic(
             delta = data_obj.get("delta", {})
             text = None
             is_thinking = False
-            if delta.get("type") == "text_delta":
+            delta_type = delta.get("type", "")
+            if delta_type == "text_delta":
                 text = delta.get("text")
                 if text and response_chunks is not None:
                     response_chunks.append(text)
-            elif delta.get("type") == "thinking_delta":
+            elif delta_type == "thinking_delta":
                 text = delta.get("thinking")
                 is_thinking = True
                 if text and thinking_chunks is not None:
                     thinking_chunks.append(text)
+            elif delta_type == "input_json_delta" and delta.get("partial_json"):
+                text = delta["partial_json"]
             if text:
                 now = time.perf_counter()
                 chunk_tokens = _estimate_tokens(text)
@@ -640,7 +671,8 @@ async def _replay_one_request_anthropic(
     metrics.thinking_tokens = thinking_token_count
 
     if token_count > 0 and first_token_time is not None:
-        metrics.decode_time_s = end - first_token_time
+        decode_end = last_token_time if last_token_time > first_token_time else end
+        metrics.decode_time_s = decode_end - first_token_time
         if metrics.decode_time_s > 0:
             metrics.tok_per_sec = token_count / metrics.decode_time_s
 
@@ -858,6 +890,7 @@ async def _replay_task_entries(
             on_complete=on_complete,
             extra_body=extra_body,
             upstream_api=upstream_api,
+            tools=entry.tools,
         )
         m.context_profile = _bucket_label(tokens)
         m.context_tokens = tokens
@@ -926,6 +959,7 @@ async def _replay_task_entries_live(
             upstream_api=upstream_api,
             response_chunks=response_chunks,
             thinking_chunks=thinking_chunks,
+            tools=entry.tools,
         )
 
         response_text = "".join(response_chunks)
@@ -966,6 +1000,7 @@ async def replay_scenario(
     max_consecutive_failures: int | None = None,
     evaluate_llm: bool = False,
     upstream_api: str | None = None,
+    anthropic_beta: str | None = None,
 ) -> BenchmarkRun:
     """Replay a recorded scenario against the configured endpoint.
 
@@ -1026,7 +1061,8 @@ async def replay_scenario(
         url = config.endpoint.rstrip("/")
     else:
         url = resolve_endpoint(config.endpoint)
-    headers = _build_headers(config, upstream_api=effective_api)
+    headers = _build_headers(config, upstream_api=effective_api, anthropic_beta=anthropic_beta)
+
 
     sliced_tasks = _apply_slice_to_tasks(scenario.tasks, slice_tokens)
     raw_queue = build_execution_queue(sliced_tasks, schedule)
@@ -1328,6 +1364,7 @@ async def _run_verbose(
                     upstream_api=upstream_api,
                     response_chunks=response_chunks,
                     thinking_chunks=thinking_chunks,
+                    tools=entry.tools,
                 )
 
                 response_text = ""
@@ -1650,6 +1687,7 @@ async def _run_verbose_text(
                     upstream_api=upstream_api,
                     response_chunks=response_chunks,
                     thinking_chunks=thinking_chunks,
+                    tools=entry.tools,
                 )
 
                 response_text = "".join(response_chunks)

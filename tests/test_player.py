@@ -6,9 +6,11 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from agentic_swarm_bench.config import BenchmarkConfig
 from agentic_swarm_bench.metrics.collector import RequestMetrics
 from agentic_swarm_bench.scenarios.player import (
     _bucket_label,
+    _build_headers,
     _compute_bucket_wall_time,
     _estimate_tokens,
     _replay_one_request,
@@ -376,8 +378,8 @@ def test_non_openai_endpoint_uses_max_tokens():
     assert "max_completion_tokens" not in captured_payload
 
 
-def test_max_tokens_capped_at_4096():
-    """max_tokens should be capped at 4096 regardless of input."""
+def test_max_tokens_passed_through():
+    """max_tokens should be forwarded to the API without capping."""
     captured_payload = {}
 
     class CapturingClient:
@@ -386,7 +388,7 @@ def test_max_tokens_capped_at_4096():
             return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
 
     _replay(client=CapturingClient(), max_tokens=16384)
-    assert captured_payload["max_tokens"] == 4096
+    assert captured_payload["max_tokens"] == 16384
 
 
 # ---------------------------------------------------------------------------
@@ -632,3 +634,692 @@ class TestStripCacheControl:
 
     def test_none_passthrough(self):
         assert _strip_cache_control(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Anthropic replay path -- SSE parsing, payload construction, headers
+# ---------------------------------------------------------------------------
+
+
+def _anthropic_event(event_type: str, data: dict) -> bytes:
+    """Build one Anthropic-style SSE event as bytes."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def _anthropic_text_delta(text: str, index: int = 0) -> bytes:
+    return _anthropic_event("content_block_delta", {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text},
+    })
+
+
+def _anthropic_thinking_delta(thinking: str, index: int = 0) -> bytes:
+    return _anthropic_event("content_block_delta", {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "thinking_delta", "thinking": thinking},
+    })
+
+
+def _anthropic_input_json_delta(partial_json: str, index: int = 1) -> bytes:
+    return _anthropic_event("content_block_delta", {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
+    })
+
+
+def _anthropic_message_start(input_tokens: int = 100) -> bytes:
+    return _anthropic_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "model": "test",
+            "usage": {"input_tokens": input_tokens},
+        },
+    })
+
+
+def _anthropic_message_delta(output_tokens: int = 50) -> bytes:
+    return _anthropic_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": output_tokens},
+    })
+
+
+class FakeAnthropicStreamResponse:
+    """Fake httpx streaming response that yields bytes for Anthropic SSE."""
+
+    def __init__(self, events: list[bytes], status_code: int = 200, body: bytes = b""):
+        self.status_code = status_code
+        self._events = events
+        self._body = body
+
+    async def aiter_bytes(self):
+        for event in self._events:
+            yield event
+
+    async def aread(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+class FakeAnthropicClient:
+    """Fake httpx.AsyncClient that returns a FakeAnthropicStreamResponse."""
+
+    def __init__(self, response: FakeAnthropicStreamResponse):
+        self._response = response
+
+    def stream(self, method, url, **kwargs):
+        return self._response
+
+
+def _replay_anthropic(**kwargs):
+    """Shorthand: call _replay_one_request with Anthropic defaults, run sync."""
+    defaults = dict(
+        client=None,
+        url="https://api.anthropic.com",
+        model="claude-test",
+        headers={"anthropic-version": "2023-06-01"},
+        messages=[{"role": "user", "content": "test"}],
+        max_tokens=512,
+        seq=0,
+        timeout=30.0,
+        upstream_api="anthropic",
+    )
+    defaults.update(kwargs)
+    return _run(_replay_one_request(**defaults))
+
+
+class TestAnthropicReplayTemperature:
+    """Anthropic replay payload must include temperature matching the OAI path."""
+
+    def test_anthropic_payload_includes_temperature(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay_anthropic(client=CapturingClient())
+        assert "temperature" in captured_payload
+        assert captured_payload["temperature"] == 0.7
+
+    def test_oai_payload_temperature_matches_anthropic(self):
+        """Both paths must use the same temperature value."""
+        captured_oai = {}
+        captured_anth = {}
+
+        class OaiCapture:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_oai.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        class AnthCapture:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_anth.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay(client=OaiCapture())
+        _replay_anthropic(client=AnthCapture())
+        assert captured_oai["temperature"] == captured_anth["temperature"]
+
+
+class TestAnthropicInputJsonDelta:
+    """Anthropic tool-use input_json_delta events must be tracked for timing."""
+
+    def test_input_json_delta_counted_for_ttft(self):
+        """When tool input is the first content, TTFT must be set."""
+        events = [
+            _anthropic_message_start(),
+            _anthropic_input_json_delta('{"query":'),
+            _anthropic_input_json_delta('"hello"}'),
+            _anthropic_message_delta(output_tokens=10),
+        ]
+        m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
+        assert m.ttft_ms > 0, "TTFT should be set from input_json_delta"
+        assert m.error is None
+
+    def test_input_json_delta_then_text_both_tracked(self):
+        """Both tool input and text deltas should contribute to timing."""
+        events = [
+            _anthropic_message_start(),
+            _anthropic_input_json_delta('{"q":"v"}'),
+            _anthropic_text_delta("Here is the result"),
+            _anthropic_message_delta(output_tokens=20),
+        ]
+        m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
+        assert m.ttft_ms > 0
+        assert m.completion_tokens == 20
+        assert len(m.itl_ms) > 0, "Should have ITL entries from multiple deltas"
+
+    def test_text_only_no_tool_input(self):
+        """Text-only responses should work exactly as before."""
+        text = "Here is a detailed response with enough content"
+        events = [
+            _anthropic_message_start(),
+            _anthropic_text_delta(text),
+            _anthropic_message_delta(output_tokens=15),
+        ]
+        m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
+        assert m.ttft_ms > 0
+        assert m.completion_tokens == 15
+        assert m.error is None
+
+
+class TestAnthropicResponseChunks:
+    """response_chunks should collect text but NOT tool input."""
+
+    def test_text_collected_in_response_chunks(self):
+        events = [
+            _anthropic_message_start(),
+            _anthropic_text_delta("Hello "),
+            _anthropic_text_delta("world"),
+            _anthropic_message_delta(output_tokens=5),
+        ]
+        response_chunks: list[str] = []
+        _replay_anthropic(
+            client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)),
+            response_chunks=response_chunks,
+        )
+        assert "".join(response_chunks) == "Hello world"
+
+    def test_tool_input_not_in_response_chunks(self):
+        events = [
+            _anthropic_message_start(),
+            _anthropic_input_json_delta('{"key":"value"}'),
+            _anthropic_text_delta("Result text"),
+            _anthropic_message_delta(output_tokens=10),
+        ]
+        response_chunks: list[str] = []
+        _replay_anthropic(
+            client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)),
+            response_chunks=response_chunks,
+        )
+        assert "".join(response_chunks) == "Result text"
+
+    def test_thinking_collected_in_thinking_chunks(self):
+        events = [
+            _anthropic_message_start(),
+            _anthropic_thinking_delta("Let me think..."),
+            _anthropic_text_delta("The answer"),
+            _anthropic_message_delta(output_tokens=10),
+        ]
+        thinking_chunks: list[str] = []
+        response_chunks: list[str] = []
+        _replay_anthropic(
+            client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)),
+            response_chunks=response_chunks,
+            thinking_chunks=thinking_chunks,
+        )
+        assert "".join(thinking_chunks) == "Let me think..."
+        assert "".join(response_chunks) == "The answer"
+
+
+class TestAnthropicBetaHeader:
+    """_build_headers must include anthropic-beta when provided."""
+
+    def test_no_beta_header_when_not_provided(self):
+        config = BenchmarkConfig(api_key="test-key")
+        headers = _build_headers(config, upstream_api="anthropic")
+        assert "anthropic-beta" not in headers
+        assert headers["anthropic-version"] == "2023-06-01"
+
+    def test_beta_header_included_when_provided(self):
+        config = BenchmarkConfig(api_key="test-key")
+        headers = _build_headers(
+            config,
+            upstream_api="anthropic",
+            anthropic_beta="prompt-caching-2024-07-31,extended-thinking-2025-04-14",
+        )
+        assert headers["anthropic-beta"] == "prompt-caching-2024-07-31,extended-thinking-2025-04-14"
+        assert headers["anthropic-version"] == "2023-06-01"
+
+    def test_beta_header_ignored_for_openai(self):
+        config = BenchmarkConfig(api_key="test-key")
+        headers = _build_headers(
+            config,
+            upstream_api="openai",
+            anthropic_beta="extended-thinking-2025-04-14",
+        )
+        assert "anthropic-beta" not in headers
+        assert "anthropic-version" not in headers
+
+    def test_anthropic_api_key_via_x_api_key(self):
+        config = BenchmarkConfig(api_key="sk-ant-123", api_key_header="Authorization")
+        headers = _build_headers(config, upstream_api="anthropic")
+        assert headers["x-api-key"] == "sk-ant-123"
+        assert "Authorization" not in headers
+
+    def test_anthropic_custom_key_header(self):
+        config = BenchmarkConfig(api_key="custom-key", api_key_header="x-custom-key")
+        headers = _build_headers(config, upstream_api="anthropic")
+        assert headers["x-custom-key"] == "custom-key"
+
+
+class TestAnthropicRetryLogic:
+    """Anthropic path should handle retries the same as OAI."""
+
+    def test_http_429_retries(self):
+        call_count = 0
+
+        class RetryClient:
+            def stream(self, method, url, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    return FakeAnthropicStreamResponse(
+                        [], status_code=429, body=b"rate limited"
+                    )
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("success"),
+                    _anthropic_message_delta(output_tokens=5),
+                ])
+
+        with patch("agentic_swarm_bench.scenarios.player.asyncio.sleep", new_callable=AsyncMock):
+            m = _replay_anthropic(client=RetryClient(), max_retries=2)
+        assert call_count == 2
+        assert m.error is None
+
+    def test_http_500_not_retried(self):
+        call_count = 0
+
+        class Error500Client:
+            def stream(self, method, url, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return FakeAnthropicStreamResponse(
+                    [], status_code=500, body=b"internal error"
+                )
+
+        m = _replay_anthropic(client=Error500Client(), max_retries=3)
+        assert call_count == 1
+        assert "500" in m.error
+
+
+class TestAnthropicMessageDeltaUsage:
+    """message_delta output_tokens should override estimated token count."""
+
+    def test_output_tokens_overrides_estimate(self):
+        events = [
+            _anthropic_message_start(input_tokens=200),
+            _anthropic_text_delta("short"),
+            _anthropic_message_delta(output_tokens=42),
+        ]
+        m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
+        assert m.completion_tokens == 42
+        assert m.prompt_tokens == 200
+
+    def test_prompt_tokens_include_cache_fields(self):
+        start_event = _anthropic_event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "test",
+                "usage": {
+                    "input_tokens": 50,
+                    "cache_read_input_tokens": 100,
+                    "cache_creation_input_tokens": 25,
+                },
+            },
+        })
+        events = [
+            start_event,
+            _anthropic_text_delta("ok"),
+            _anthropic_message_delta(output_tokens=5),
+        ]
+        m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
+        assert m.prompt_tokens == 175  # 50 + 100 + 25
+
+
+# ---------------------------------------------------------------------------
+# Anthropic decode_time_s / tok_per_sec timing parity
+# ---------------------------------------------------------------------------
+
+
+class DelayedAnthropicStreamResponse(FakeAnthropicStreamResponse):
+    """Yields events with configurable delays between groups.
+
+    *delay_before_index* inserts *delay_seconds* before yielding the event
+    at that index, simulating network latency for trailing protocol events.
+    """
+
+    def __init__(
+        self,
+        events: list[bytes],
+        delay_before_index: int,
+        delay_seconds: float,
+        **kwargs,
+    ):
+        super().__init__(events, **kwargs)
+        self._delay_idx = delay_before_index
+        self._delay_s = delay_seconds
+
+    async def aiter_bytes(self):
+        for i, event in enumerate(self._events):
+            if i == self._delay_idx:
+                await asyncio.sleep(self._delay_s)
+            yield event
+
+
+class TestDecodeTimingParity:
+    """decode_time_s should measure first→last content token, not stream close."""
+
+    def test_trailing_events_excluded_from_decode_time(self):
+        """Anthropic trailing events (message_delta, message_stop) must not
+        inflate decode_time_s.  We insert a 200ms delay before message_delta
+        and assert that decode_time_s is well under that."""
+        events = [
+            _anthropic_message_start(input_tokens=10),
+            _anthropic_text_delta("Hello "),
+            _anthropic_text_delta("world "),
+            _anthropic_text_delta("test "),
+            _anthropic_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _anthropic_message_delta(output_tokens=3),
+            _anthropic_event("message_stop", {"type": "message_stop"}),
+        ]
+        delay_idx = 4  # delay before content_block_stop
+        resp = DelayedAnthropicStreamResponse(events, delay_idx, 0.2)
+        m = _replay_anthropic(client=FakeAnthropicClient(resp))
+
+        assert m.error is None
+        assert m.completion_tokens == 3
+        assert m.decode_time_s is not None
+        assert m.decode_time_s < 0.15, (
+            f"decode_time_s={m.decode_time_s:.3f}s includes trailing overhead; "
+            "should measure first→last content token only"
+        )
+
+    def test_single_token_falls_back_to_end(self):
+        """With only one content chunk, last_token_time == first_token_time.
+        decode_time_s should still be a small positive value (falls back to end)."""
+        events = [
+            _anthropic_message_start(input_tokens=5),
+            _anthropic_text_delta("hi"),
+            _anthropic_message_delta(output_tokens=1),
+        ]
+        m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
+        assert m.error is None
+        assert m.completion_tokens == 1
+        assert m.decode_time_s is not None
+        assert m.decode_time_s > 0
+
+    def test_tok_per_sec_uses_content_window(self):
+        """tok_per_sec should reflect tokens / (last_content - first_content),
+        not tokens / (stream_close - first_content)."""
+        events = [
+            _anthropic_message_start(input_tokens=10),
+            _anthropic_text_delta("a " * 50),
+            _anthropic_text_delta("b " * 50),
+            _anthropic_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _anthropic_message_delta(output_tokens=100),
+            _anthropic_event("message_stop", {"type": "message_stop"}),
+        ]
+        delay_idx = 3  # delay before content_block_stop
+        resp = DelayedAnthropicStreamResponse(events, delay_idx, 0.3)
+        m = _replay_anthropic(client=FakeAnthropicClient(resp))
+
+        assert m.error is None
+        assert m.tok_per_sec is not None
+        assert m.tok_per_sec > 100, (
+            f"tok_per_sec={m.tok_per_sec:.1f} is too low; "
+            "trailing delay is leaking into decode_time_s"
+        )
+
+
+class DelayedOAIStreamResponse(FakeStreamResponse):
+    """FakeStreamResponse that sleeps before a specific line index."""
+
+    def __init__(self, lines: list[str], delay_before_index: int, delay_seconds: float, **kwargs):
+        super().__init__(lines, **kwargs)
+        self._delay_idx = delay_before_index
+        self._delay_s = delay_seconds
+
+    async def aiter_lines(self):
+        for i, line in enumerate(self.lines):
+            if i == self._delay_idx:
+                await asyncio.sleep(self._delay_s)
+            yield line
+
+
+class TestOAIDecodeTimingParity:
+    """OpenAI decode_time_s should also exclude trailing usage/DONE overhead."""
+
+    def test_usage_line_delay_excluded_from_decode_time(self):
+        """A 200ms gap between last content and usage/DONE should not inflate TPS."""
+        content_lines = _make_sse_lines(
+            [_sse_chunk("hello "), _sse_chunk("world ")],
+            usage={"prompt_tokens": 10, "completion_tokens": 50},
+        )
+        delay_idx = len(content_lines) - 2  # usage line (just before [DONE])
+        resp = DelayedOAIStreamResponse(content_lines, delay_idx, 0.2)
+        m = _replay(client=FakeClient(resp))
+
+        assert m.error is None
+        assert m.decode_time_s is not None
+        assert m.decode_time_s < 0.15, (
+            f"decode_time_s={m.decode_time_s:.3f}s includes trailing overhead"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tools injection in replay payload
+# ---------------------------------------------------------------------------
+
+
+_SAMPLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "editor",
+            "description": "Edit a file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+]
+
+
+class TestToolsInPayload:
+    """Tools from the recording must be included in the replay payload."""
+
+    def test_openai_payload_includes_tools(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        _replay(client=CapturingClient(), tools=_SAMPLE_TOOLS)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 2
+        assert captured_payload["tools"][0]["function"]["name"] == "bash"
+
+    def test_openai_payload_omits_tools_when_none(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        _replay(client=CapturingClient(), tools=None)
+        assert "tools" not in captured_payload
+
+    def test_anthropic_payload_includes_tools_converted(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay_anthropic(client=CapturingClient(), tools=_SAMPLE_TOOLS)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 2
+        assert captured_payload["tools"][0]["name"] == "bash"
+        assert "input_schema" in captured_payload["tools"][0]
+
+    def test_anthropic_payload_omits_tools_when_none(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay_anthropic(client=CapturingClient(), tools=None)
+        assert "tools" not in captured_payload
+
+
+class TestOpenaiToolsToAnthropic:
+    """_openai_tools_to_anthropic converts OAI function tools to Anthropic format."""
+
+    def test_converts_function_tools(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        result = _openai_tools_to_anthropic(_SAMPLE_TOOLS)
+        assert len(result) == 2
+        assert result[0]["name"] == "bash"
+        assert result[0]["description"] == "Run a shell command"
+        assert result[0]["input_schema"]["type"] == "object"
+
+    def test_skips_non_function_tools(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        tools = [
+            {"type": "web_search"},
+            {"type": "function", "function": {"name": "bash", "parameters": {}}},
+        ]
+        result = _openai_tools_to_anthropic(tools)
+        assert len(result) == 1
+        assert result[0]["name"] == "bash"
+
+    def test_empty_tools(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        assert _openai_tools_to_anthropic([]) == []
+
+    def test_missing_description_and_parameters(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        tools = [{"type": "function", "function": {"name": "bare_tool"}}]
+        result = _openai_tools_to_anthropic(tools)
+        assert len(result) == 1
+        assert result[0]["name"] == "bare_tool"
+        assert result[0]["description"] == ""
+        assert result[0]["input_schema"] == {}
+
+
+class TestToolsEdgeCases:
+    """Edge cases around empty or degenerate tools lists."""
+
+    def test_empty_tools_list_omitted_from_openai_payload(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        _replay(client=CapturingClient(), tools=[])
+        assert "tools" not in captured_payload
+
+    def test_empty_tools_list_omitted_from_anthropic_payload(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay_anthropic(client=CapturingClient(), tools=[])
+        assert "tools" not in captured_payload
+
+    def test_tools_with_non_function_types_openai(self):
+        """Non-function tools (e.g. web_search) pass through in OAI payload."""
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        tools = [
+            {"type": "web_search"},
+            {"type": "function", "function": {"name": "bash", "parameters": {}}},
+        ]
+        _replay(client=CapturingClient(), tools=tools)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 2
+
+    def test_tools_with_non_function_types_anthropic_filters(self):
+        """Non-function tools should be filtered out in the Anthropic conversion."""
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        tools = [
+            {"type": "web_search"},
+            {"type": "function", "function": {"name": "bash", "parameters": {}}},
+        ]
+        _replay_anthropic(client=CapturingClient(), tools=tools)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 1
+        assert captured_payload["tools"][0]["name"] == "bash"

@@ -22,6 +22,8 @@ _POLICY_CHOICES = ["round_robin", "sequential"]
 if _HAS_SCHEDULER:
     _POLICY_CHOICES += ["random", "interleaved_random"]
 
+_AGENT_CMD_HELP = "Agent CLI command (default: claude)"
+
 
 class DefaultGroup(click.Group):
     """Click Group that dispatches to a default subcommand when none is recognised.
@@ -424,7 +426,7 @@ def eval(ctx, endpoint, model, api_key, api_key_header, tasks, validate, context
     help="Header name for the API key",
 )
 @click.option("--tasks", "-t", default="p1-p10", help="Task range")
-@click.option("--agent-cmd", default="claude", help="Agent CLI command (default: claude)")
+@click.option("--agent-cmd", default="claude", help=_AGENT_CMD_HELP)
 @click.option("--proxy-port", type=int, default=19000, help="Proxy listen port")
 @click.option("--output", "-o", default=None, help="Save results to file")
 @click.option(
@@ -726,6 +728,13 @@ def record(ctx, endpoint, model, api_key, api_key_header, port, output, upstream
     "(api.anthropic.com → anthropic, everything else → openai).",
 )
 @click.option(
+    "--anthropic-beta",
+    default=None,
+    help="Comma-separated Anthropic beta feature flags sent as the anthropic-beta header. "
+    "Required for features like extended thinking "
+    "(e.g. 'prompt-caching-2024-07-31,extended-thinking-2025-04-14').",
+)
+@click.option(
     "--timeout",
     type=click.FloatRange(min=0.1),
     default=300.0,
@@ -863,6 +872,7 @@ def replay(
     output,
     json_stdout,
     upstream_api,
+    anthropic_beta,
     timeout,
     slice_tokens,
     dry_run,
@@ -930,7 +940,8 @@ def replay(
       asb replay -e URL -m MODEL -w js-coding-opus
       asb replay -e https://api.anthropic.com -m claude-sonnet-4-20250514 \\
         -w scenario.json --upstream-api anthropic -k $ANTHROPIC_API_KEY \\
-        --api-key-header x-api-key
+        --api-key-header x-api-key \\
+        --anthropic-beta prompt-caching-2024-07-31,extended-thinking-2025-04-14
     """
     if verbose and verbose_text:
         raise click.UsageError("--verbose and --verbose-text are mutually exclusive")
@@ -980,6 +991,7 @@ def replay(
                 max_consecutive_failures=max_consecutive_failures,
                 evaluate_llm=evaluate_llm,
                 upstream_api=upstream_api,
+                anthropic_beta=anthropic_beta,
             )
         )
     except FileNotFoundError as e:
@@ -1117,6 +1129,8 @@ def compare(baseline, candidate, output):
         console.print(f"Comparison saved to {output}")
     else:
         console.print(text)
+
+
 
 
 if __name__ == "__main__":

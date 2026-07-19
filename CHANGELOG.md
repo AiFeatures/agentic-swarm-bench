@@ -2,6 +2,99 @@
 
 All notable changes to AgenticSwarmBench are documented here.
 
+## [4.0.9] - 2026-05-06
+
+### Fixed
+
+- **Tools never captured in scenario recordings.** The recorder wrote
+  `tools: null` for every JSONL entry, even when the original request
+  included tool definitions. Models replayed from these recordings
+  generated prose instead of calling tools. All three recording paths
+  (OpenAI, Anthropic passthrough, Responses API) now capture the
+  `tools` array from the request body.
+
+- **Tools not injected during replay.** The player never sent tool
+  definitions in the replay payload, so models had no tools available.
+  `_replay_one_request` and `_replay_one_request_anthropic` now accept
+  and forward a `tools` parameter. For Anthropic replay, OpenAI-format
+  function tools are converted to Anthropic's `input_schema` format.
+  All replay modes (recorded, live, verbose, verbose-text, interleaved)
+  thread `entry.tools` through to the request.
+
+- **Cache-defeat crash on `content: null` messages.** `_serialize_messages`
+  and `_reconstruct_messages` in the BPE-aware poisoning module crashed
+  with `TypeError` when encountering tool_calls messages (`content: null`).
+  Both functions now treat `None` content as empty string for serialization
+  while preserving the original `null` in the reconstructed output.
+
+---
+
+## [4.0.8] - 2026-05-05
+
+### Fixed
+
+- **Proxy URL double-pathing on non-root upstream endpoints.** When
+  `upstream_url` already contained an API suffix (e.g.
+  `https://host/prefix/v1/messages`), the proxy appended another
+  `/v1/chat/completions`, producing an invalid path like
+  `/v1/messages/v1/chat/completions`. Both the proxy server and recorder
+  now strip known API suffixes before building the upstream URL.
+
+- **Upstream API detection for proxied Anthropic endpoints.** Endpoints
+  like `https://proxy.example.com/abc/v1/messages` were misdetected as
+  OpenAI because detection only checked the hostname. The detector now
+  also inspects the URL path, so `/v1/messages` endpoints are correctly
+  identified as Anthropic regardless of host.
+
+---
+
+## [4.0.6] - 2026-05-04
+
+### Fixed
+
+- **`tok_per_sec` systematically lower on Anthropic replay.** `decode_time_s`
+  was measured from the first content token to stream close. The Anthropic
+  stream includes trailing protocol events (`content_block_stop`,
+  `message_delta`, `message_stop`) after the last content token, inflating
+  the denominator. Both OpenAI and Anthropic paths now measure
+  `decode_time_s` as first-content-token → last-content-token, producing
+  consistent throughput numbers when hitting the same backend.
+
+---
+
+## [4.0.5] - 2026-05-04
+
+### Fixed
+
+- **Anthropic replay temperature mismatch.** The Anthropic replay path was
+  missing the `temperature` field in its payload, causing the API to use its
+  default (1.0) while the OpenAI path always sent 0.7. Both paths now use the
+  same temperature for consistent benchmark results.
+
+- **Tool-use timing wrong on Anthropic replay.** `input_json_delta` events
+  (tool call arguments) were silently dropped by the Anthropic SSE parser,
+  causing TTFT and inter-token latency to be incorrect when the first output
+  was a tool call. These deltas are now tracked for timing metrics.
+
+### Added
+
+- **`--anthropic-beta` flag for replay.** Sends the `anthropic-beta` HTTP
+  header during Anthropic replay, enabling features like extended thinking
+  and prompt caching (e.g. `--anthropic-beta
+  prompt-caching-2024-07-31,extended-thinking-2025-04-14`).
+
+---
+
+## [4.0.4] - 2026-04-30
+
+### Fixed
+
+- **`max_tokens` silently capped at 4096.** Replay now passes the configured
+  `max_tokens` value through to the API unchanged, allowing models with larger
+  completion windows to use their full capacity.
+
+---
+
 ## [4.0.3] - 2026-04-22
 
 ### Added
